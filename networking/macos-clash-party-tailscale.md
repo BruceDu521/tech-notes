@@ -101,7 +101,9 @@ proxies+:
     hostname: macbook-mihomo
     state-dir: tailscale
     ephemeral: false
-    udp: true
+    # 这次访问 MongoDB 和 HTTPS 管理站点只需要 TCP。
+    # udp: false 同样可以正常工作；它不是 Rebind 错误的根因。
+    udp: false
     accept-routes: true
     ip-version: ipv4-prefer
 
@@ -114,21 +116,73 @@ proxies+:
 
   - IP-CIDR,100.64.0.0/10,tailscale,no-resolve
   - IP-CIDR6,fd7a:115c:a1e0::/48,tailscale,no-resolve
+
+# 某些自定义域名虽然指向 tailnet IP，但 Tailscale outbound 按域名拨号
+# 仍可能超时。固定到实际 tailnet IP 后，Mihomo 会直接把 IP 交给
+# Tailscale outbound。请替换为自己的地址。
+hosts:
+  private-admin.example.com: 100.80.81.61
 ```
 
 注意：这个可用配置里**没有** `dialer-proxy`。
 
-如果环境确实需要 Tailscale 自己处理 split DNS，可以按 Mihomo 文档尝试原生 resolver：
+如果环境需要 Tailscale 自己处理 MagicDNS / split DNS，可以使用 Mihomo
+为该 outbound 注册的原生 resolver：
 
 ```yaml
 dns:
   respect-rules: true
   nameserver-policy:
-    "+.example-tailnet.ts.net":
-      - "ts://tailscale"
+    "+.example-tailnet.ts.net": "tailscale://tailscale"
+
+  # tailnet 域名必须返回真实 100.x 地址，不能继续分配 198.18.x.x fake IP。
+  fake-ip-filter:
+    - "+.example-tailnet.ts.net"
 ```
 
-对于完整的 tailnet FQDN，域名规则交给 Tailscale outbound 后通常已足够。建议先完成 outbound 登录和连通性验证，再单独增加 DNS 配置，避免把两个问题混在一起。
+`nameserver-policy` 和 `fake-ip-filter` 缺一不可：前者选择 Tailscale DNS，
+后者确保应用拿到真实 tailnet IP，而不是 Mihomo 的 `198.18.0.0/16`
+fake IP。
+
+### Clash Party 的 DNS 覆写优先级陷阱
+
+Clash Party 的 YAML 覆写优先级低于应用级“DNS 覆写”。如果主界面的
+“DNS 覆写”已开启，即使 YAML 中写了：
+
+```yaml
+dns:
+  fake-ip-filter+:
+    - "+.example-tailnet.ts.net"
+```
+
+最终生成配置里也可能没有这一项。此次排障中的实际表现是：
+
+- 自定义管理域名通过 `hosts` 后已经连接成功；
+- 页面依赖的 MagicDNS API 主机仍显示为 `198.18.x.x`；
+- 日志持续出现 `match DomainSuffix/... using tailscale`，随后
+  `context deadline exceeded`；
+- MongoDB 的其他 tailnet 连接同时可以成功，说明 Tailscale 数据面正常。
+
+处理方式是在 Clash Party 主界面点击“DNS 覆写”卡片，将
+`+.example-tailnet.ts.net` 加入那里的 `fake-ip-filter` 列表，再重启 Core。
+随后检查最终生成配置，而不是只看 YAML 覆写编辑器。
+
+### 用 IP + TLS 测试区分传输与解析问题
+
+如果域名访问超时，可以让 HTTPS 代理直接连接目标 tailnet IP，同时保留
+原域名作为 SNI：
+
+```bash
+openssl s_client \
+  -proxy 127.0.0.1:7890 \
+  -connect 100.80.81.61:443 \
+  -servername private-admin.example.com \
+  -brief </dev/null
+```
+
+若该测试成功、证书校验也正确，但域名方式仍超时，则已经排除目标服务、
+ACL、TCP 443 和 TLS。问题应继续沿域名解析和 fake-IP 元数据路径排查，
+不应再反复调整 UDP 或 DERP。
 
 ## 首次登录步骤
 
@@ -152,6 +206,8 @@ dns:
 | `match DomainSuffix/...` 后出现 `Rebind IPv4 failed` | 已命中 outbound，但 MagicSock 无法绑定 | 删除 `dialer-proxy`，重启 Core |
 | 出现交互式登录 URL | tsnet 已成功启动，等待授权 | 本地打开 URL，切勿分享 |
 | 第一次请求超时，第二次成功 | outbound lazy initialization | 属于预期行为，可重试 |
+| 直接连接 tailnet IP 的 TCP/TLS 成功，但同一服务域名超时 | 数据面和服务正常，域名解析路径异常 | 使用 `hosts` 固定自定义域名，或配置 Tailscale DNS |
+| 管理域名成功，但下游 `*.ts.net` API 仍显示 `198.18.x.x` 并超时 | 应用级 DNS 覆写覆盖了 YAML 的 fake-IP filter | 在 Clash Party“DNS 覆写”中加入 tailnet suffix，并检查最终配置 |
 | 能登录但长期只走慢速 relay | 运行时路径质量问题 | 检查 DERP、UDP、NAT，必要时使用更靠近服务端的 relay/peer |
 
 ## 安全和维护建议
@@ -166,5 +222,8 @@ dns:
 ## 参考资料
 
 - [Mihomo Tailscale outbound 文档](https://wiki.metacubex.one/en/config/proxies/tailscale/)
+- [Mihomo hosts 文档](https://wiki.metacubex.one/en/config/dns/hosts/)
+- [Mihomo DNS 配置文档](https://wiki.metacubex.one/en/config/dns/)
 - [Mihomo PR #2786：Tailscale outbound support](https://github.com/MetaCubeX/mihomo/pull/2786)
+- [Clash Party YAML 覆写优先级与合并规则](https://clashparty.org/docs/guide/override/yaml)
 - [Tailscale 与 Clash 共存的一种 userspace SOCKS5 方案](https://jiz4oh.com/2024/09/tailscale-with-clash/)
